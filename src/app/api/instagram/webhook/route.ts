@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { NextResponse, after } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import { decrypt } from '@/lib/whatsapp/encryption';
@@ -101,6 +102,73 @@ export async function GET(request: Request) {
 }
 
 /**
+ * Verify the Instagram webhook HMAC signature.
+ *
+ * Instagram webhooks can be subscribed under a Meta app that is
+ * different from the WhatsApp Cloud API app — in that case Meta signs
+ * Instagram payloads with THAT app's secret, not the `META_APP_SECRET`
+ * used by the WhatsApp webhook. We therefore prefer a dedicated
+ * `INSTAGRAM_APP_SECRET` when set, and fall back to `META_APP_SECRET`.
+ *
+ * Logs exactly what was tried so a mismatch is diagnosable in Vercel
+ * logs instead of a bare "Invalid signature".
+ */
+function verifyInstagramWebhookSignature(
+  rawBody: string,
+  signatureHeader: string | null,
+): boolean {
+  const candidates = [
+    { name: 'INSTAGRAM_APP_SECRET', value: process.env.INSTAGRAM_APP_SECRET },
+    { name: 'META_APP_SECRET', value: process.env.META_APP_SECRET },
+  ];
+
+  for (const { name, value } of candidates) {
+    if (!value) continue;
+    if (verifyMetaWebhookSignatureWithSecret(rawBody, signatureHeader, value)) {
+      return true;
+    }
+  }
+
+  // Log the failure reason for Vercel logs.
+  const missing = candidates
+    .filter((c) => !c.value)
+    .map((c) => c.name)
+    .join(', ');
+  if (missing) {
+    console.warn(
+      `[instagram/webhook] Invalid signature — no matching secret. Missing env: ${missing || 'none'}. ` +
+        'If Instagram is subscribed under a different Meta App than WhatsApp, set INSTAGRAM_APP_SECRET to that app\'s secret.'
+    );
+  } else {
+    console.warn(
+      '[instagram/webhook] Invalid signature — signed body does not match INSTAGRAM_APP_SECRET or META_APP_SECRET. ' +
+        'Confirm the webhook is subscribed under the same Meta App whose secret is configured.'
+    );
+  }
+  return false;
+}
+
+function verifyMetaWebhookSignatureWithSecret(
+  rawBody: string,
+  signatureHeader: string | null,
+  secret: string,
+): boolean {
+  if (!signatureHeader) return false;
+  if (!signatureHeader.startsWith('sha256=')) return false;
+  try {
+    const expected =
+      'sha256=' +
+      crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+    const a = Buffer.from(signatureHeader);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * POST — Receive Instagram DM events.
  *
  * When someone DMs the Instagram Business Account, Meta sends a POST
@@ -115,7 +183,7 @@ export async function POST(request: Request) {
   const rawBody = await request.text();
   const signature = request.headers.get('x-hub-signature-256');
 
-  if (!verifyMetaWebhookSignature(rawBody, signature)) {
+  if (!verifyInstagramWebhookSignature(rawBody, signature)) {
     console.warn('[instagram/webhook] Invalid signature');
     return NextResponse.json({ error: 'Invalid signature' }, { status: 401 });
   }
