@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Instagram Graph API client — DM integration.
  *
  * Uses the same Meta Graph API base (v21.0) as the WhatsApp integration.
@@ -16,6 +16,10 @@ interface MetaErrorResponse {
   error?: { message?: string; code?: number; type?: string };
 }
 
+interface MetaPermissionResponse {
+  data?: Array<{ permission?: string; status?: string }>;
+}
+
 async function throwMetaError(response: Response, fallback: string): Promise<never> {
   let message = fallback;
   try {
@@ -27,10 +31,6 @@ async function throwMetaError(response: Response, fallback: string): Promise<nev
   throw new Error(message);
 }
 
-// ============================================================
-// Verification — fetch IG Business Account info
-// ============================================================
-
 export interface InstagramUserInfo {
   id: string;
   username: string;
@@ -41,34 +41,60 @@ export interface InstagramUserInfo {
 export interface VerifyInstagramCredentialsArgs {
   igUserId: string;
   accessToken: string;
+  requiredPermissions?: string[];
 }
 
-/**
- * Verify Instagram credentials by fetching the IG Business Account
- * metadata. Throws if the token or IG user id is invalid.
- */
 export async function verifyInstagramCredentials(
   args: VerifyInstagramCredentialsArgs
 ): Promise<InstagramUserInfo> {
-  const { igUserId, accessToken } = args;
+  const { igUserId, accessToken, requiredPermissions = ['instagram_manage_messages'] } = args;
   const url = `${META_API_BASE}/${igUserId}?fields=id,username,name,profile_picture_url`;
+
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
+
   if (!response.ok) {
     await throwMetaError(response, `Meta API error: ${response.status}`);
   }
-  return response.json();
-}
 
-// ============================================================
-// Sending DMs
-// ============================================================
+  const userInfo = (await response.json()) as InstagramUserInfo;
+
+  try {
+    const permissionsUrl = `${META_API_BASE}/me/permissions`;
+    const permissionsResponse = await fetch(permissionsUrl, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    if (permissionsResponse.ok) {
+      const permissionsData = (await permissionsResponse.json()) as MetaPermissionResponse;
+      const grantedPermissions = (permissionsData.data ?? [])
+        .map((entry) => entry.permission)
+        .filter((permission): permission is string => Boolean(permission));
+
+      const missingPermissions = requiredPermissions.filter(
+        (permission) => !grantedPermissions.includes(permission)
+      );
+
+      if (missingPermissions.length > 0) {
+        throw new Error(
+          `Token is valid for the Instagram account but missing required permission(s): ${missingPermissions.join(', ')}. Use a Page Access Token with instagram_manage_messages for the connected Facebook Page.`
+        );
+      }
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('missing required permission')) {
+      throw error;
+    }
+    console.warn('[instagram] Could not inspect token permissions:', error);
+  }
+
+  return userInfo;
+}
 
 export interface SendInstagramDmArgs {
   igUserId: string;
   accessToken: string;
-  /** Instagram-scoped user id of the recipient (not their username). */
   recipientId: string;
   text: string;
 }
@@ -77,13 +103,6 @@ export interface SendInstagramDmResult {
   messageId: string;
 }
 
-/**
- * Send a DM on Instagram.
- *
- * The `recipientId` must be the Instagram-scoped user id (a numeric
- * string), which comes from the webhook's `sender.id` field — NOT
- * the user's Instagram username.
- */
 export async function sendInstagramDm(
   args: SendInstagramDmArgs
 ): Promise<SendInstagramDmResult> {
@@ -110,26 +129,12 @@ export async function sendInstagramDm(
   return { messageId: data.message_id ?? data.id ?? 'unknown' };
 }
 
-// ============================================================
-// Webhook verification helpers
-// ============================================================
-
-/**
- * Build the Instagram webhook verification challenge response.
- * Same pattern as the WhatsApp webhook — Meta sends:
- *   ?hub.mode=subscribe&hub.challenge=<challenge>&hub.verify_token=<token>
- */
 export interface InstagramWebhookVerifyParams {
   mode: string | null;
   challenge: string | null;
   verifyToken: string | null;
 }
 
-/**
- * Result of webhook verification.
- * - { verified: true, challenge } — pass this challenge string back as the response
- * - { verified: false } — verification failed
- */
 export interface InstagramWebhookVerifyResult {
   verified: boolean;
   challenge?: string;
@@ -149,17 +154,13 @@ export function verifyInstagramWebhook(
   return { verified: false };
 }
 
-// ============================================================
-// Inbound DM webhook types
-// ============================================================
-
 export interface InstagramSender {
   id: string;
-  user_id?: string; // Instagram-scoped user id of the sender
+  user_id?: string;
 }
 
 export interface InstagramMessage {
-  mid: string; // message id
+  mid: string;
   text?: string;
   is_echo?: boolean;
   quick_reply?: { payload: string };
@@ -170,21 +171,37 @@ export interface InstagramMessage {
   }>;
 }
 
+export interface InstagramChangedMessage {
+  id: string;
+  from: string;
+  text?: string | { body?: string };
+  timestamp?: number;
+  type?: string;
+}
+
 export interface InstagramMessagingEntry {
-  sender: InstagramSender;
-  recipient: { id: string };
-  timestamp: number;
+  sender?: InstagramSender;
+  recipient_id?: string;
+  recipient?: { id: string };
+  timestamp?: number;
   message?: InstagramMessage;
 }
 
 export interface InstagramWebhookEntry {
-  id: string; // IG Business Account id
-  time: number;
-  messaging: InstagramMessagingEntry[];
+  id?: string;
+  time?: number;
+  messaging?: InstagramMessagingEntry[];
+  changes?: Array<{
+    field?: string;
+    value?: {
+      messaging?: InstagramMessagingEntry[];
+      messages?: InstagramChangedMessage[];
+    };
+  }>;
 }
 
 export interface InstagramWebhookPayload {
-  object: string; // "instagram"
-  entry: InstagramWebhookEntry[];
+  object?: string;
+  entry?: InstagramWebhookEntry[];
 }
 

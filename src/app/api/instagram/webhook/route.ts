@@ -1,4 +1,4 @@
-import crypto from 'node:crypto';
+﻿import crypto from 'node:crypto';
 import { NextResponse, after } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import { decrypt } from '@/lib/whatsapp/encryption';
@@ -6,6 +6,7 @@ import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature';
 import { sendInstagramDm } from '@/lib/instagram/client';
 import type {
   InstagramWebhookPayload,
+  InstagramWebhookEntry,
   InstagramMessagingEntry,
   SendInstagramDmArgs,
 } from '@/lib/instagram';
@@ -19,8 +20,8 @@ export const maxDuration = 60;
 // ============================================================
 // Instagram DM Webhook
 //
-// GET  — Webhook verification (hub.challenge)
-// POST — Receive incoming DMs, detect keywords, respond with wa.me link
+// GET  â€” Webhook verification (hub.challenge)
+// POST â€” Receive incoming DMs, detect keywords, respond with wa.me link
 // ============================================================
 
 // Lazy-initialized service-role client for DB lookups
@@ -37,7 +38,7 @@ function supabaseAdmin() {
 }
 
 /**
- * GET — Instagram webhook verification.
+ * GET â€” Instagram webhook verification.
  *
  * Meta sends a GET request with:
  *   ?hub.mode=subscribe&hub.challenge=<challenge>&hub.verify_token=<token>
@@ -84,7 +85,7 @@ export async function GET(request: Request) {
           });
         }
       } catch {
-        // Malformed / wrong-key token row — skip it
+        // Malformed / wrong-key token row â€” skip it
       }
     }
 
@@ -105,7 +106,7 @@ export async function GET(request: Request) {
  * Verify the Instagram webhook HMAC signature.
  *
  * Instagram webhooks can be subscribed under a Meta app that is
- * different from the WhatsApp Cloud API app — in that case Meta signs
+ * different from the WhatsApp Cloud API app â€” in that case Meta signs
  * Instagram payloads with THAT app's secret, not the `META_APP_SECRET`
  * used by the WhatsApp webhook. We therefore prefer a dedicated
  * `INSTAGRAM_APP_SECRET` when set, and fall back to `META_APP_SECRET`.
@@ -136,12 +137,12 @@ function verifyInstagramWebhookSignature(
     .join(', ');
   if (missing) {
     console.warn(
-      `[instagram/webhook] Invalid signature — no matching secret. Missing env: ${missing || 'none'}. ` +
+      `[instagram/webhook] Invalid signature â€” no matching secret. Missing env: ${missing || 'none'}. ` +
         'If Instagram is subscribed under a different Meta App than WhatsApp, set INSTAGRAM_APP_SECRET to that app\'s secret.'
     );
   } else {
     console.warn(
-      '[instagram/webhook] Invalid signature — signed body does not match INSTAGRAM_APP_SECRET or META_APP_SECRET. ' +
+      '[instagram/webhook] Invalid signature â€” signed body does not match INSTAGRAM_APP_SECRET or META_APP_SECRET. ' +
         'Confirm the webhook is subscribed under the same Meta App whose secret is configured.'
     );
   }
@@ -169,7 +170,7 @@ function verifyMetaWebhookSignatureWithSecret(
 }
 
 /**
- * POST — Receive Instagram DM events.
+ * POST â€” Receive Instagram DM events.
  *
  * When someone DMs the Instagram Business Account, Meta sends a POST
  * with the message payload. We:
@@ -222,17 +223,59 @@ export async function POST(request: Request) {
 // Webhook processing logic
 // ============================================================
 
+export function extractInstagramMessagingEvents(entry: InstagramWebhookEntry) {
+  const events: InstagramMessagingEntry[] = [];
+
+  if (entry.messaging) {
+    events.push(...entry.messaging);
+  }
+
+  if (entry.changes) {
+    for (const change of entry.changes) {
+      if (!change?.value) continue;
+      if (change.value.messaging) {
+        events.push(...change.value.messaging);
+        continue;
+      }
+
+      if (!change.value.messages) continue;
+
+      for (const message of change.value.messages) {
+        if (!message || !message.from) continue;
+
+        const text =
+          typeof message.text === 'string'
+            ? message.text
+            : message.text?.body;
+
+        events.push({
+          sender: { id: message.from },
+          recipient: { id: entry.id ?? "" },
+          timestamp: message.timestamp ?? Date.now(),
+          message: {
+            mid: message.id,
+            text,
+          },
+        });
+      }
+    }
+  }
+
+  return events;
+}
+
 async function processInstagramWebhook(body: InstagramWebhookPayload) {
   if (!body.entry) return;
 
   for (const entry of body.entry) {
-    if (!entry.messaging) continue;
+    const events = extractInstagramMessagingEvents(entry);
+    if (!events.length) continue;
 
-    for (const event of entry.messaging) {
-      // Isolate each event — a failure on one DM must not abort the
+    for (const event of events) {
+      // Isolate each event â€” a failure on one DM must not abort the
       // rest of the batch (or leave Meta to retry the whole payload).
       try {
-        await handleInstagramMessagingEvent(event, entry.id);
+        await handleInstagramMessagingEvent(event, entry.id ?? "");
       } catch (err) {
         console.error('[instagram/webhook] event handling error:', err);
       }
@@ -248,11 +291,13 @@ async function processInstagramWebhook(body: InstagramWebhookPayload) {
 async function trySendInstagramDm(args: SendInstagramDmArgs, label: string) {
   try {
     await sendInstagramDm(args);
+    return true;
   } catch (err) {
     console.error(
       `[instagram/webhook] Failed to send DM (${label}):`,
       err instanceof Error ? err.message : err
     );
+    return false;
   }
 }
 
@@ -263,7 +308,8 @@ async function handleInstagramMessagingEvent(
   // Only process text messages from users (not echoes of our own replies)
   if (!event.message || !event.message.text || event.message.is_echo) return;
 
-  const senderId = event.sender.id;
+  const senderId = event.sender?.id;
+  if (!senderId) return;
   const messageText = event.message.text.trim();
 
   if (!messageText) return;
@@ -288,7 +334,7 @@ async function handleInstagramMessagingEvent(
     return;
   }
 
-  // Update last_webhook_at. Best-effort — failures here must not break
+  // Update last_webhook_at. Best-effort â€” failures here must not break
   // the main DM-reply flow, so use a try/catch (NOT `.catch()`: the
   // Supabase query builder is thenable but has no `.catch` method, and
   // chaining one throws `TypeError` before the reply is ever sent).
@@ -329,7 +375,7 @@ async function handleInstagramMessagingEvent(
   }
 
   if (!product) {
-    // No product matches — send a helpful fallback message
+    // No product matches â€” send a helpful fallback message
     console.log(
       `[instagram/webhook] No product found for keyword: "${keyword}"`
     );
@@ -344,28 +390,34 @@ async function handleInstagramMessagingEvent(
 
     if (activeProducts && activeProducts.length > 0) {
       const suggestions = (activeProducts as Array<{trigger_keyword: string; name: string}>)
-        .map((p) => `${p.trigger_keyword} — ${p.name}`)
+        .map((p) => `${p.trigger_keyword} â€” ${p.name}`)
         .join('\n');
 
-      await trySendInstagramDm(
+      const sent = await trySendInstagramDm(
         {
           igUserId,
           accessToken,
           recipientId: senderId,
-          text: `Hi! I couldn't find a product for "${keyword}". Here are the available keywords:\n\n${suggestions}\n\nReply with a keyword to get started! 👋`,
+          text: `Hi! I couldn't find a product for "${keyword}". Here are the available keywords:\n\n${suggestions}\n\nReply with a keyword to get started! ðŸ‘‹`,
         },
         'fallback-with-suggestions'
       );
+      if (sent) {
+        console.log(`[instagram/webhook] Sent fallback DM for "${keyword}" to ${senderId}`);
+      }
     } else {
-      await trySendInstagramDm(
+      const sent = await trySendInstagramDm(
         {
           igUserId,
           accessToken,
           recipientId: senderId,
-          text: `Hi! Thanks for your message. I couldn't find anything matching "${keyword}". Please check back later for available products! 👋`,
+          text: `Hi! Thanks for your message. I couldn't find anything matching "${keyword}". Please check back later for available products! ðŸ‘‹`,
         },
         'fallback'
       );
+      if (sent) {
+        console.log(`[instagram/webhook] Sent fallback DM for "${keyword}" to ${senderId}`);
+      }
     }
     return;
   }
@@ -383,15 +435,18 @@ async function handleInstagramMessagingEvent(
 
   if (whatsappError || !whatsappConfig?.display_phone_number) {
     console.error('[instagram/webhook] No WhatsApp config for account');
-    await trySendInstagramDm(
+    const sent = await trySendInstagramDm(
       {
         igUserId,
         accessToken,
         recipientId: senderId,
-        text: `Thanks for your interest in "${product.name}"! Please complete your purchase on WhatsApp. I'll be right there! 🛒`,
+        text: `Thanks for your interest in "${product.name}"! Please complete your purchase on WhatsApp. I'll be right there! ðŸ›’`,
       },
       'no-whatsapp-config'
     );
+    if (sent) {
+      console.log(`[instagram/webhook] Sent WhatsApp fallback DM for "${product.name}" to ${senderId}`);
+    }
     return;
   }
 
@@ -401,18 +456,25 @@ async function handleInstagramMessagingEvent(
 
   // 5. Send the wa.me link back on Instagram DM
   const priceStr = `${product.currency} ${Number(product.price).toFixed(2)}`;
-  await trySendInstagramDm(
+  const sent = await trySendInstagramDm(
     {
       igUserId,
       accessToken,
       recipientId: senderId,
-      text: `Great choice! You selected: *${product.name}* (${priceStr})\n\nClick the link below to complete your order on WhatsApp:\n${waLink}\n\nJust press send, and our team will help you out! 🚀`,
+      text: `Great choice! You selected: *${product.name}* (${priceStr})\n\nClick the link below to complete your order on WhatsApp:\n${waLink}\n\nJust press send, and our team will help you out! ðŸš€`,
     },
     'product-link'
   );
 
-  console.log(
-    `[instagram/webhook] Sent wa.me link for "${product.name}" to ${senderId}`
-  );
+  if (sent) {
+    console.log(
+      `[instagram/webhook] Sent wa.me link for "${product.name}" to ${senderId}`
+    );
+  }
 }
+
+
+
+
+
 

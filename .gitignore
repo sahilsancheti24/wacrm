@@ -45,3 +45,8 @@ next-env.d.ts
 
 audit-report.json
 supabase/.temp/
+
+# dev/scratch
+dev-server.log
+messages/*.bak
+/files/

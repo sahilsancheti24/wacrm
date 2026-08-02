@@ -4,9 +4,10 @@
  * without waiting for a real Meta delivery.
  *
  * It:
- *   1. Loads .env.local (so META_APP_SECRET + the service-role creds resolve)
+ *   1. Loads .env.local (so INSTAGRAM_APP_SECRET / META_APP_SECRET + the service-role creds resolve)
  *   2. Builds a fake Instagram "messaging" payload
- *   3. HMAC-signs the raw body with META_APP_SECRET (same as Meta does)
+ *   3. HMAC-signs the raw body with the Instagram app secret (same as Meta does);
+ *      prefers INSTAGRAM_APP_SECRET and falls back to META_APP_SECRET
  *   4. POSTs to the webhook URL
  *
  * Usage:
@@ -55,11 +56,15 @@ const baseUrl = (process.argv[2] || 'http://localhost:3000').replace(/\/$/, '');
 const igUserId =
   process.env.IG_USER_ID || process.argv[3] || '17841400000000000';
 const message = process.env.MESSAGE || process.argv[4] || 'HELLO';
-const secret = process.env.META_APP_SECRET;
+// Meta signs Instagram webhook payloads with the secret of the app the
+// webhook is subscribed under. Prefer INSTAGRAM_APP_SECRET (the dedicated
+// Instagram app secret) and fall back to META_APP_SECRET (the WhatsApp app
+// secret) — mirrors the webhook route's verification logic.
+const secret = process.env.INSTAGRAM_APP_SECRET || process.env.META_APP_SECRET;
 
 if (!secret) {
   console.error(
-    '✗ META_APP_SECRET is not set (checked .env.local and environment).',
+    '✗ Neither INSTAGRAM_APP_SECRET nor META_APP_SECRET is set (checked .env.local and environment).',
   );
   process.exit(1);
 }
