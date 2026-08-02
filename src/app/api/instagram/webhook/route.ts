@@ -1,9 +1,19 @@
-import { NextResponse } from 'next/server';
+import { NextResponse, after } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import { decrypt } from '@/lib/whatsapp/encryption';
 import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature';
 import { sendInstagramDm } from '@/lib/instagram/client';
-import type { InstagramWebhookPayload, InstagramMessagingEntry } from '@/lib/instagram';
+import type {
+  InstagramWebhookPayload,
+  InstagramMessagingEntry,
+  SendInstagramDmArgs,
+} from '@/lib/instagram';
+
+// The `after()` callback in POST runs within this route's max duration.
+// Inbound processing fans out to DB lookups + Meta API send calls, so
+// give it headroom beyond the platform default (Vercel clamps this to
+// the plan's ceiling). Tune as needed.
+export const maxDuration = 60;
 
 // ============================================================
 // Instagram DM Webhook
@@ -117,11 +127,24 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
   }
 
-  // Process in the background — ack Meta immediately
+  // Process AFTER the response so we ack Meta within their ~20s timeout
+  // (a slow ack triggers Meta retries + duplicate processing), while still
+  // guaranteeing the work runs to completion.
+  //
+  // This MUST use `after()` rather than a detached `processInstagramWebhook(body)`
+  // promise: on serverless platforms (we run on Vercel) the function can be
+  // frozen or terminated the moment the response is sent, so a floating
+  // promise's DB writes are not guaranteed to finish. `after()` hands the
+  // callback to the runtime, which keeps the function alive until it resolves
+  // (within the route's maxDuration).
   if (body.object === 'instagram' && body.entry) {
-    processInstagramWebhook(body).catch((err) =>
-      console.error('[instagram/webhook] processing error:', err)
-    );
+    after(async () => {
+      try {
+        await processInstagramWebhook(body);
+      } catch (error) {
+        console.error('[instagram/webhook] processing error:', error);
+      }
+    });
   }
 
   return NextResponse.json({ status: 'received' }, { status: 200 });
@@ -138,8 +161,30 @@ async function processInstagramWebhook(body: InstagramWebhookPayload) {
     if (!entry.messaging) continue;
 
     for (const event of entry.messaging) {
-      await handleInstagramMessagingEvent(event, entry.id);
+      // Isolate each event — a failure on one DM must not abort the
+      // rest of the batch (or leave Meta to retry the whole payload).
+      try {
+        await handleInstagramMessagingEvent(event, entry.id);
+      } catch (err) {
+        console.error('[instagram/webhook] event handling error:', err);
+      }
     }
+  }
+}
+
+/**
+ * Best-effort DM send. A failure to send must not abort processing of
+ * the rest of the batch, so swallow errors with a log instead of letting
+ * them propagate up to `processInstagramWebhook`.
+ */
+async function trySendInstagramDm(args: SendInstagramDmArgs, label: string) {
+  try {
+    await sendInstagramDm(args);
+  } catch (err) {
+    console.error(
+      `[instagram/webhook] Failed to send DM (${label}):`,
+      err instanceof Error ? err.message : err
+    );
   }
 }
 
@@ -175,12 +220,21 @@ async function handleInstagramMessagingEvent(
     return;
   }
 
-  // Update last_webhook_at
-  await db
-    .from('instagram_config')
-    .update({ last_webhook_at: new Date().toISOString() })
-    .eq('id', config.id)
-    .catch(() => {});
+  // Update last_webhook_at. Best-effort — failures here must not break
+  // the main DM-reply flow, so use a try/catch (NOT `.catch()`: the
+  // Supabase query builder is thenable but has no `.catch` method, and
+  // chaining one throws `TypeError` before the reply is ever sent).
+  try {
+    const { error: touchError } = await db
+      .from('instagram_config')
+      .update({ last_webhook_at: new Date().toISOString() })
+      .eq('id', config.id);
+    if (touchError) {
+      console.warn('[instagram/webhook] Failed to update last_webhook_at:', touchError);
+    }
+  } catch (err) {
+    console.warn('[instagram/webhook] last_webhook_at update threw:', err);
+  }
 
   // Decrypt the access token
   let accessToken: string;
@@ -225,19 +279,25 @@ async function handleInstagramMessagingEvent(
         .map((p) => `${p.trigger_keyword} — ${p.name}`)
         .join('\n');
 
-      await sendInstagramDm({
-        igUserId,
-        accessToken,
-        recipientId: senderId,
-        text: `Hi! I couldn't find a product for "${keyword}". Here are the available keywords:\n\n${suggestions}\n\nReply with a keyword to get started! 👋`,
-      });
+      await trySendInstagramDm(
+        {
+          igUserId,
+          accessToken,
+          recipientId: senderId,
+          text: `Hi! I couldn't find a product for "${keyword}". Here are the available keywords:\n\n${suggestions}\n\nReply with a keyword to get started! 👋`,
+        },
+        'fallback-with-suggestions'
+      );
     } else {
-      await sendInstagramDm({
-        igUserId,
-        accessToken,
-        recipientId: senderId,
-        text: `Hi! Thanks for your message. I couldn't find anything matching "${keyword}". Please check back later for available products! 👋`,
-      });
+      await trySendInstagramDm(
+        {
+          igUserId,
+          accessToken,
+          recipientId: senderId,
+          text: `Hi! Thanks for your message. I couldn't find anything matching "${keyword}". Please check back later for available products! 👋`,
+        },
+        'fallback'
+      );
     }
     return;
   }
@@ -255,12 +315,15 @@ async function handleInstagramMessagingEvent(
 
   if (whatsappError || !whatsappConfig?.display_phone_number) {
     console.error('[instagram/webhook] No WhatsApp config for account');
-    await sendInstagramDm({
-      igUserId,
-      accessToken,
-      recipientId: senderId,
-      text: `Thanks for your interest in "${product.name}"! Please complete your purchase on WhatsApp. I'll be right there! 🛒`,
-    });
+    await trySendInstagramDm(
+      {
+        igUserId,
+        accessToken,
+        recipientId: senderId,
+        text: `Thanks for your interest in "${product.name}"! Please complete your purchase on WhatsApp. I'll be right there! 🛒`,
+      },
+      'no-whatsapp-config'
+    );
     return;
   }
 
@@ -270,12 +333,15 @@ async function handleInstagramMessagingEvent(
 
   // 5. Send the wa.me link back on Instagram DM
   const priceStr = `${product.currency} ${Number(product.price).toFixed(2)}`;
-  await sendInstagramDm({
-    igUserId,
-    accessToken,
-    recipientId: senderId,
-    text: `Great choice! You selected: *${product.name}* (${priceStr})\n\nClick the link below to complete your order on WhatsApp:\n${waLink}\n\nJust press send, and our team will help you out! 🚀`,
-  });
+  await trySendInstagramDm(
+    {
+      igUserId,
+      accessToken,
+      recipientId: senderId,
+      text: `Great choice! You selected: *${product.name}* (${priceStr})\n\nClick the link below to complete your order on WhatsApp:\n${waLink}\n\nJust press send, and our team will help you out! 🚀`,
+    },
+    'product-link'
+  );
 
   console.log(
     `[instagram/webhook] Sent wa.me link for "${product.name}" to ${senderId}`

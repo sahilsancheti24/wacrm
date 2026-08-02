@@ -1,22 +1,16 @@
-# Instagram DM Integration — Implementation Plan
+# TODO — Fix Instagram DM replies (webhook not replying)
 
-## Files to Create/Modify
-- [x] `supabase/migrations/040_instagram_config.sql` — New table for IG credentials
-- [x] `src/lib/instagram/client.ts` — Graph API client for Instagram (send DMs, verify)
-- [x] `src/lib/instagram/index.ts` — Exports
-- [x] `src/app/api/instagram/webhook/route.ts` — GET (verify) + POST (receive DMs, respond with wa.me link)
-- [x] `src/app/api/instagram/config/route.ts` — GET/POST/DELETE for IG config management
-- [x] `src/components/settings/instagram-config.tsx` — Instagram settings form
-- [x] `src/app/(dashboard)/settings/page.tsx` — Add Instagram tab
-- [x] `messages/en.json` — Add Instagram settings translations
-- [x] `src/components/settings/instagram-config.tsx` — Update to use i18n `t()` calls
+## Root cause
+`src/app/api/instagram/webhook/route.ts` called `.catch()` on the Supabase query
+builder (thenable, but no `.catch` method) in `handleInstagramMessagingEvent`,
+which threw `TypeError` on every incoming DM — the crash happened before the
+product lookup / `sendInstagramDm` was ever reached, so the app never replied.
 
-## Follow-up (current task)
-- [x] Apply migration `040` to remote Supabase (`instagram_config` table now live)
-- [x] Fix `DROP POLICY` syntax error in `040_instagram_config.sql` and push to `origin/main` (`17f285b`)
-- [x] Verify webhook route works (`{"error":"Verification token mismatch"}` → 403, table exists)
-- [x] Verify TypeScript typecheck passes (`tsc --noEmit` exit 0)
-- [x] Verify dev server serves the app (`/login` → 200, `/` → 307 to `/login`)
-- [ ] Run i18n parity test (`npx vitest run src/i18n/messages.test.ts`) — `ko.json` parity fix deferred
-- [ ] Deploy to Vercel (`vercel-deploy` branch exists) so the public webhook callback URL is reachable by Meta
+## Steps
+- [x] 1. Import `after` from `next/server` in the Instagram webhook route
+- [x] 2. Add `export const maxDuration = 60` (Vercel headroom for DB + Meta calls)
+- [x] 3. Replace invalid `.catch(() => {})` on the `last_webhook_at` update with a proper try/catch
+- [x] 4. Replace the floating `processInstagramWebhook(body).catch(...)` with `after(async () => { ... })` so background processing reliably runs on Vercel
+- [x] 5. Add per-event try/catch in the processing loop + wrap each `sendInstagramDm` call in its own try/catch with error logging (error isolation)
+- [x] 6. Typecheck (`npm run typecheck`) — no Instagram-related errors found
 
