@@ -12,6 +12,11 @@
 - [x] `src/components/settings/instagram-config.tsx` — Update to use i18n `t()` calls
 
 ## Follow-up (current task)
-- [ ] Run i18n parity test (`npx vitest run src/i18n/messages.test.ts`) to confirm app state
-- [ ] Start dev server (`npm run dev`) and verify the app is running with Instagram integration live
+- [x] Apply migration `040` to remote Supabase (`instagram_config` table now live)
+- [x] Fix `DROP POLICY` syntax error in `040_instagram_config.sql` and push to `origin/main` (`17f285b`)
+- [x] Verify webhook route works (`{"error":"Verification token mismatch"}` → 403, table exists)
+- [x] Verify TypeScript typecheck passes (`tsc --noEmit` exit 0)
+- [x] Verify dev server serves the app (`/login` → 200, `/` → 307 to `/login`)
+- [ ] Run i18n parity test (`npx vitest run src/i18n/messages.test.ts`) — `ko.json` parity fix deferred
+- [ ] Deploy to Vercel (`vercel-deploy` branch exists) so the public webhook callback URL is reachable by Meta
 
