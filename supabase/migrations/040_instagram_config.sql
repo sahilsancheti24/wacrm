@@ -40,8 +40,7 @@ DROP POLICY IF EXISTS "Members can view instagram config" ON instagram_config;
 CREATE POLICY "Members can view instagram config" ON instagram_config FOR SELECT
   USING (is_account_member(account_id));
 
-DROP POLICY IF EXISTS "Admins can manage instagram config" ON instagram_config
-  USING (is_account_member(account_id, 'agent'));
+DROP POLICY IF EXISTS "Admins can manage instagram config" ON instagram_config;
 
 -- Allow admin/owner to insert/update/delete
 DROP POLICY IF EXISTS "Admins can insert instagram config" ON instagram_config;
